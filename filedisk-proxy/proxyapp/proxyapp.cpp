@@ -278,20 +278,20 @@ BOOLEAN initProxy()
         FILE_SHARE_READ | FILE_SHARE_WRITE,                      // do not share
         NULL,                   // default security
         OPEN_EXISTING,             // create new file only
-//        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,  // normal file
-          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,  // normal file
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,  // normal file
+          //FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_WRITE_THROUGH,  // normal file
         NULL);                  // no attr. template
 
     if (file_handle == INVALID_HANDLE_VALUE)
     {
-        // meaning the file already exists, so open it.
+        // meaning the file does not exists, so create new file
         file_handle = CreateFileW(wcharlink,                // name of the write
             GENERIC_ALL,          // open for writing
             FILE_SHARE_READ | FILE_SHARE_WRITE,                      // do not share
             NULL,                   // default security
             CREATE_NEW,             // create new file only
-            //FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,  // normal file
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,  // normal file
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,  // normal file
+            //FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_WRITE_THROUGH,  // normal file
             NULL);                  // no attr. template
         if (file_handle == INVALID_HANDLE_VALUE)
         {
@@ -302,7 +302,7 @@ BOOLEAN initProxy()
     
         // file created, so set it's new length
         FILE_END_OF_FILE_INFO lenInfo;
-        lenInfo.EndOfFile.QuadPart = 104857600;
+        lenInfo.EndOfFile.QuadPart = BACKEND_VHD_FILE_SIZE; // 1GB Virtual Disk File Size
         status = SetFileInformationByHandle(file_handle, FileEndOfFileInfo, &lenInfo, sizeof(FILE_END_OF_FILE_INFO));
         if (!status)
         {
@@ -314,8 +314,7 @@ BOOLEAN initProxy()
     }
     std::cout << "init: disk file created/opened.\r\n";
 
-    OpenFileInformation.FileSize.HighPart = 0;
-    OpenFileInformation.FileSize.LowPart = 0;
+    OpenFileInformation.FileSize.HighPart = OpenFileInformation.FileSize.LowPart = 0;
     OpenFileInformation.FileSize.QuadPart = 0;
     OpenFileInformation.FileSize.u = { 0,0 };
 
@@ -456,7 +455,6 @@ BOOLEAN initServerClientThread()
     strcpy((char*)&OpenFileInformation.FileName, "\\??\\");
     strcat(OpenFileInformation.FileName, file_name);
     OpenFileInformation.FileNameLength = (USHORT)strlen(OpenFileInformation.FileName);
-    //OpenFileInformation.FileSize.QuadPart = 104857600;
     OpenFileInformation.DriveLetter = *DriveNameAlphabet;
     OpenFileInformation.ReadOnly = FALSE;
 
@@ -558,7 +556,6 @@ BOOLEAN initServerClientThread()
         return FALSE;
     }
     std::cout << "initServerClientThread Method: DeviceIoControl-IOCTL_REGISTER_FILE->Success.\r\n";
-//    Sleep(1000);
     return TRUE;
 
 }
@@ -585,20 +582,20 @@ DWORD WINAPI ServerClientThreadFunction(LPVOID lpParam)
         if (WaitStatus == WAIT_OBJECT_0)
         {
             // success, the driver set the event flag
-            std::cout << "Driver set DriverRequestDataSet Event\r\n";
+            //std::cout << "Driver set DriverRequestDataSet Event\r\n";
         }
         else if (WaitStatus == WAIT_TIMEOUT)
         {
             // the driver did not set the event flag, so continue
             //std::cout << "ServerClientThreadFunction->DriverRequestDataSet timeout, it is not set by the driver.\r\n";
-            std::cout << "Wait timeout at DriverRequestDataSet Event\r\n";
+            //std::cout << "Wait timeout at DriverRequestDataSet Event\r\n";
             continue;
         }
         else
         {
             // error or exception, continue
             //std::cout << "WaitForSingleObject else section, bug.\r\n";
-            std::cout << "Unknown error at waiting for DriverRequestDataSet Event\r\n";
+            //std::cout << "Unknown error at waiting for DriverRequestDataSet Event\r\n";
             continue;
         }
 
@@ -673,11 +670,12 @@ DWORD WINAPI ServerClientThreadFunction(LPVOID lpParam)
             }
 
             // wait for driver event to occur
+            // When Driver sets RequestComplete Event, it completes the sequence of entire request.
             WaitStatus = WaitForSingleObject(RequestComplete, 10000);
             if (WaitStatus == WAIT_OBJECT_0)
             {
                 ResetEvent(RequestComplete);
-                // success, the driver set the event flag
+                // success, the driver set the event flag, so break.
                 break;
             }
             else if (WaitStatus == WAIT_TIMEOUT)
@@ -693,9 +691,10 @@ DWORD WINAPI ServerClientThreadFunction(LPVOID lpParam)
                 continue;
             }
         }
-            
+        // here, the request sequence completes, then loop reloops.
     }
     // phase 2 = completion and close
+    // Server Thread completes and terminates here.
     //myThreadHandle = NULL;
     ExitThread(0);
 //    return TRUE;

@@ -75,8 +75,9 @@ typedef struct _DEVICE_EXTENSION {
     KEVENT                      request_event;
     PVOID                       thread_pointer;
     BOOLEAN                     terminate_thread;
-    HANDLE                      shmSemaphoreSync;
-    PKSEMAPHORE                 pshmSemaphoreSyncObj;
+    BOOLEAN                     fileClosingNow;
+ //   HANDLE                      shmSemaphoreSync;
+//    PKSEMAPHORE                 pshmSemaphoreSyncObj;
 
     // driver's shared memory
     PVOID                   	g_pSharedSection;
@@ -94,10 +95,10 @@ typedef struct _DEVICE_EXTENSION {
     PVOID                   	pRequestCompleteObj;
     HANDLE                      RequestComplete;
     PKEVENT                     KeRequestCompleteObj;
-    PRKMUTEX                    shmMutexObj;
+    //PRKMUTEX                    shmMutexObj;
 
     // pipelines
-    HANDLE                      hReqServerPipe;
+    //HANDLE                      hReqServerPipe;
 } DEVICE_EXTENSION, * PDEVICE_EXTENSION;
 
 #ifdef _PREFAST_
@@ -118,6 +119,11 @@ NTSTATUS SetSecurityAllAccess(HANDLE h, PVOID obj);
 NTSTATUS connectReqServerPipeline(PDEVICE_OBJECT device_object);
 NTSTATUS disconnectReqServerPipeline(PDEVICE_OBJECT device_object);
 void printStatusFile(char* path, char* status);
+//VOID CancelIrpRoutine(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
+//NTSTATUS DispatchCleanup(PDEVICE_OBJECT fdo, PIRP Irp);
+//NTSTATUS CompleteRequest(PIRP Irp, NTSTATUS status, ULONG_PTR Information);
+//VOID FileDiskClearQueue(IN PVOID Context);
+VOID FileDiskFreeIrpWithMdls(PIRP Irp);
 
 NTSTATUS
 DriverEntry(
@@ -287,12 +293,14 @@ DriverEntry(
         ZwClose(dir_handle);
         return status;
     }
+   
 
     DriverObject->MajorFunction[IRP_MJ_CREATE] = FileDiskCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = FileDiskCreateClose;
     DriverObject->MajorFunction[IRP_MJ_READ] = FileDiskReadWrite;
     DriverObject->MajorFunction[IRP_MJ_WRITE] = FileDiskReadWrite;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = FileDiskDeviceControl;
+    //DriverObject->MajorFunction[IRP_MJ_CLEANUP] = DispatchCleanup;
 
     DriverObject->DriverUnload = FileDiskUnload;
 
@@ -325,6 +333,7 @@ FileDiskCreateDevice(
     device_name.Length = 0;
     device_name.MaximumLength = MAXIMUM_FILENAME_LENGTH * 2;
 
+    /* original
     if (DeviceType == FILE_DEVICE_CD_ROM)
     {
         RtlUnicodeStringPrintf(&device_name, DEVICE_NAME_PREFIX L"Cd" L"%u", Number);
@@ -333,10 +342,14 @@ FileDiskCreateDevice(
     {
         RtlUnicodeStringPrintf(&device_name, DEVICE_NAME_PREFIX L"%u", Number);
     }
+    */
+    // todo tushar
+    RtlUnicodeStringPrintf(&device_name, DEVICE_NAME_PREFIX L"%u", Number);
 
+    /* original
     RtlInitUnicodeString(&sddl, _T("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;BU)"));
 
-    /*
+    
     status = IoCreateDeviceSecure(
         DriverObject,
         sizeof(DEVICE_EXTENSION),
@@ -347,7 +360,9 @@ FileDiskCreateDevice(
         &sddl,
         NULL,
         &device_object
-    );*/
+    );
+    */
+
     status = IoCreateDevice(
         DriverObject,
         sizeof(DEVICE_EXTENSION),
@@ -357,8 +372,7 @@ FileDiskCreateDevice(
         FALSE,
         &device_object
     );
-
-
+    
     if (!NT_SUCCESS(status))
     {
         ExFreePool(device_name.Buffer);
@@ -377,17 +391,13 @@ FileDiskCreateDevice(
     device_extension->device_number = Number;
     device_extension->device_type = DeviceType;
 
+    /* original
     if (DeviceType == FILE_DEVICE_CD_ROM)
     {
         device_object->Characteristics |= FILE_READ_ONLY_DEVICE;
         device_extension->read_only = TRUE;
     }
-
-    // TODO: create current device's shared memory
-    CreateSharedMemory(device_object);
-
-    // TODO: create current device's events
-    CreateSharedEventsKe(device_object);
+    */
 
     InitializeListHead(&device_extension->list_head);
 
@@ -400,6 +410,15 @@ FileDiskCreateDevice(
     );
 
     device_extension->terminate_thread = FALSE;
+    
+    // TODO TUSHAR
+    device_extension->fileClosingNow = FALSE;
+
+    // TODO tushar: create current device's shared memory
+    CreateSharedMemory(device_object);
+
+    // TODO tushar: create current device's events
+    CreateSharedEventsKe(device_object);
 
     status = PsCreateSystemThread(
         &thread_handle,
@@ -582,6 +601,11 @@ FileDiskReadWrite(
 
     IoMarkIrpPending(Irp);
 
+    // todo tushar
+    // set the cancel routine
+    //
+    //IoSetCancelRoutine(Irp, CancelIrpRoutine);
+
     ExInterlockedInsertTailList(
         &device_extension->list_head,
         &Irp->Tail.Overlay.ListEntry,
@@ -596,6 +620,181 @@ FileDiskReadWrite(
 
     return STATUS_PENDING;
 }
+/*
+NTSTATUS DispatchCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+    PDEVICE_EXTENSION device_extension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION io_stack;// = IoGetCurrentIrpStackLocation(Irp);
+    PLIST_ENTRY         request;
+    PIRP                irp;
+
+//    KeAcquireSpinLockAtDpcLevel(&DeviceObject->DeviceQueue.Lock);
+    DbgPrint("DispatchCleanup method running.\r\n");
+
+    while ((request = ExInterlockedRemoveHeadList(
+        &device_extension->list_head,
+        &device_extension->list_lock
+    )) != NULL)
+    {
+        irp = CONTAINING_RECORD(request, IRP, Tail.Overlay.ListEntry);
+        io_stack = IoGetCurrentIrpStackLocation(irp);
+        irp->IoStatus.Status = STATUS_CANCELLED;
+        irp->IoStatus.Information = 0;
+//        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        IoCompleteRequest(
+            irp,
+            (CCHAR)(NT_SUCCESS(irp->IoStatus.Status) ?
+                IO_DISK_INCREMENT : IO_NO_INCREMENT)
+        );
+    }
+
+    DbgPrint("DispatchCleanup method completed.\r\n");
+    return STATUS_SUCCESS;
+  //  KeReleaseSpinLockFromDpcLevel(&DeviceObject->DeviceQueue.Lock);
+}
+*/
+
+/*
+NTSTATUS DispatchCleanup(PDEVICE_OBJECT fdo, PIRP Irp)
+{
+    PDEVICE_EXTENSION pdx = (PDEVICE_EXTENSION)fdo->DeviceExtension;
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+    PFILE_OBJECT fop = stack->FileObject;
+    LIST_ENTRY cancellist;
+    InitializeListHead(&cancellist);
+
+    DbgPrint("DispatchCleanup method init\r\n");
+
+    KIRQL oldirql;
+    IoAcquireCancelSpinLock(&oldirql);
+    KeAcquireSpinLockAtDpcLevel(&fdo->DeviceQueue.Lock);
+
+    PLIST_ENTRY first = &fdo->DeviceQueue.DeviceListHead;
+    PLIST_ENTRY next;
+
+    for (next = first->Flink; next != first; )
+    {
+        PIRP QueuedIrp = CONTAINING_RECORD(next,
+            IRP, Tail.Overlay.ListEntry);
+        PIO_STACK_LOCATION QueuedIrpStack =
+            IoGetCurrentIrpStackLocation(QueuedIrp);
+
+        PLIST_ENTRY current = next;
+        next = next->Flink;
+
+        if (QueuedIrpStack->FileObject != fop)
+            continue;
+
+        IoSetCancelRoutine(QueuedIrp, NULL);
+        RemoveEntryList(current);
+        InsertTailList(&cancellist, current);
+    }
+
+    KeReleaseSpinLockFromDpcLevel(&fdo->DeviceQueue.Lock);
+    IoReleaseCancelSpinLock(oldirql);
+
+    while (!IsListEmpty(&cancellist))
+    {
+        next = RemoveHeadList(&cancellist);
+        PIRP CancelIrp = CONTAINING_RECORD(next, IRP, Tail.Overlay.ListEntry);
+        CompleteRequest(CancelIrp, STATUS_CANCELLED, 0);
+    }
+
+    DbgPrint("DispatchCleanup method completed\r\n");
+    return CompleteRequest(Irp, STATUS_SUCCESS, 0);
+}
+
+NTSTATUS CompleteRequest(PIRP Irp, NTSTATUS status, ULONG_PTR Information)
+{
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = Information;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+VOID CancelIrpRoutine(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP Irp
+)
+
+{
+    PDEVICE_EXTENSION devExtension = DeviceObject->DeviceExtension;
+    PLIST_ENTRY nextEl = NULL;
+    PIRP cancelIrp = NULL;
+    KIRQL irql;
+    KIRQL cancelIrql = Irp->CancelIrql;
+
+    DbgPrint("CancelIrpRoutine method init\r\n");
+
+    //
+    // release the cancel spinlock now
+    //
+
+    IoReleaseCancelSpinLock(cancelIrql);
+
+    //
+    // A thread has terminated and we should find a
+    // cancelled Irp in our queue and complete it
+    //
+
+    KeAcquireSpinLock(&devExtension->list_lock, &irql);
+
+    //
+    // search our queue for an Irp to cancel
+    //
+
+    for (nextEl = devExtension->list_head.Flink;
+        nextEl != &devExtension->list_head; )
+
+    {
+
+        cancelIrp = CONTAINING_RECORD(nextEl, IRP, Tail.Overlay.ListEntry);
+        nextEl = nextEl->Flink;
+        if (cancelIrp->Cancel) {
+
+            //
+            // dequeue THIS irp
+            //
+
+            RemoveEntryList(&cancelIrp->Tail.Overlay.ListEntry);
+
+            //
+            // and stop right here
+            //
+            break;
+
+        }
+        cancelIrp = NULL;
+
+    }
+    KeReleaseSpinLock(&devExtension->list_lock, irql);
+
+    //
+    // now if we found an irp to cancel, cancel it
+    //
+
+    if (cancelIrp) {
+
+        //
+        // this is our IRP to cancel
+        // 
+        cancelIrp->IoStatus.Status = STATUS_CANCELLED;
+        cancelIrp->IoStatus.Information = 0;
+        IoCompleteRequest(cancelIrp, IO_NO_INCREMENT);
+
+        //IoCompleteRequest(cancelIrp, IO_NO_INCREMENT);
+
+    }
+
+    DbgPrint("CancelIrpRoutine method completed\r\n");
+
+    //
+    // we are done.
+    //
+
+}
+*/
+
 
 NTSTATUS
 FileDiskDeviceControl(
@@ -612,11 +811,9 @@ FileDiskDeviceControl(
 
     io_stack = IoGetCurrentIrpStackLocation(Irp);
     
-    
     if (!device_extension->media_in_device &&
         io_stack->Parameters.DeviceIoControl.IoControlCode !=
-        IOCTL_REGISTER_FILE && io_stack->Parameters.DeviceIoControl.IoControlCode !=
-        IOCTL_TEST)
+        IOCTL_REGISTER_FILE)
     {
         Irp->IoStatus.Status = STATUS_NO_MEDIA_IN_DEVICE;
         Irp->IoStatus.Information = 0;
@@ -625,7 +822,6 @@ FileDiskDeviceControl(
 
         return STATUS_NO_MEDIA_IN_DEVICE;
     }
-    
 
     switch (io_stack->Parameters.DeviceIoControl.IoControlCode)
     {
@@ -655,7 +851,7 @@ FileDiskDeviceControl(
          //                 SeImpersonateClient(device_extension->security_client_context, NULL);
 
                           // TODO
-
+        /*
 
         PCONTEXT_REQUEST ctx;
         IO_STATUS_BLOCK iostatus;
@@ -682,7 +878,7 @@ FileDiskDeviceControl(
         disconnectReqServerPipeline(DeviceObject);
         ctx = NULL;
         //}/
-
+        */
 
         //                   PsRevertToSelf();
 
@@ -1282,6 +1478,44 @@ FileDiskDeviceControl(
 
 #pragma code_seg("PAGE")
 
+
+VOID FileDiskClearQueue(IN PVOID Context)
+{
+    PDEVICE_OBJECT      device_object;
+    PDEVICE_EXTENSION   device_extension;
+    PLIST_ENTRY         request;
+    PIRP                irp;
+    PIO_STACK_LOCATION  io_stack;
+
+    device_object = (PDEVICE_OBJECT)Context;
+    device_extension = (PDEVICE_EXTENSION)device_object->DeviceExtension;
+
+    // user requested to close the file, so cancel all requests and remove them from list and reset
+    DbgPrint("FileDiskClearQueue method init\r\n");
+    
+    while ((request = ExInterlockedRemoveHeadList(
+        &device_extension->list_head,
+        &device_extension->list_lock
+    )) != NULL)
+    {
+        irp = CONTAINING_RECORD(request, IRP, Tail.Overlay.ListEntry);
+        io_stack = IoGetCurrentIrpStackLocation(irp);
+
+        // cancel every queued irp-request if user set the termination flag
+        irp->IoStatus.Status = STATUS_CANCELLED;// STATUS_SUCCESS;
+        irp->IoStatus.Information = 0;
+        IoCompleteRequest(
+            irp,
+            (CCHAR)(NT_SUCCESS(irp->IoStatus.Status) ?
+                IO_DISK_INCREMENT : IO_NO_INCREMENT)
+        );
+        DbgPrint("FileDiskClearQueue method: queued irp cancelled.\r\n");
+    }
+    
+    DbgPrint("FileDiskClearQueue method completed\r\n");
+
+}
+
 VOID
 FileDiskThread(
     IN PVOID Context
@@ -1321,30 +1555,79 @@ FileDiskThread(
 
         if (device_extension->terminate_thread)
         {
+            while ((request = ExInterlockedRemoveHeadList(
+                &device_extension->list_head,
+                &device_extension->list_lock
+            )) != NULL)
+            {
+                irp = CONTAINING_RECORD(request, IRP, Tail.Overlay.ListEntry);
+                io_stack = IoGetCurrentIrpStackLocation(irp);
+
+                // terminate thread flag set, meaning driver is unloading. so cancel all queued requests and complete this current loop for further termination.
+                // user has closed the file, meaning driver and this thread must remain existent, so cancel all queued requests and cancel all future incoming
+                // requests until file's shutdown is complete.
+                irp->IoStatus.Status = STATUS_CANCELLED;// STATUS_SUCCESS;
+                irp->IoStatus.Information = 0;
+                IoCompleteRequest(
+                    irp,
+                    (CCHAR)(NT_SUCCESS(irp->IoStatus.Status) ?
+                        IO_DISK_INCREMENT : IO_NO_INCREMENT)
+                );
+                // reloop and cancel all requests and empty the loop's queue
+            }
             PsTerminateSystemThread(STATUS_SUCCESS);
         }
+
         while ((request = ExInterlockedRemoveHeadList(
             &device_extension->list_head,
             &device_extension->list_lock
         )) != NULL)
         {
             irp = CONTAINING_RECORD(request, IRP, Tail.Overlay.ListEntry);
-
             io_stack = IoGetCurrentIrpStackLocation(irp);
 
+            // validate event flags
+            if (device_extension->terminate_thread)
+            {
+                // terminate thread flag set, meaning driver is unloading. so cancel all queued requests and complete this current loop for further termination.
+                // user has closed the file, meaning driver and this thread must remain existent, so cancel all queued requests and cancel all future incoming
+                // requests until file's shutdown is complete.
+                irp->IoStatus.Status = STATUS_CANCELLED;// STATUS_SUCCESS;
+                irp->IoStatus.Information = 0;
+                IoCompleteRequest(
+                    irp,
+                    (CCHAR)(NT_SUCCESS(irp->IoStatus.Status) ?
+                        IO_DISK_INCREMENT : IO_NO_INCREMENT)
+                );
+                // reloop and cancel all requests and empty the loop's queue
+                continue;
+            }
+
+            if (device_extension->fileClosingNow)
+            {
+                // user has closed the file, meaning driver and this thread must remain existent, so cancel all queued requests and cancel all future incoming
+                // requests until file's shutdown is complete.
+                irp->IoStatus.Status = STATUS_CANCELLED;// STATUS_SUCCESS;
+                irp->IoStatus.Information = 0;
+                IoCompleteRequest(
+                    irp,
+                    (CCHAR)(NT_SUCCESS(irp->IoStatus.Status) ?
+                        IO_DISK_INCREMENT : IO_NO_INCREMENT)
+                );
+                // reloop and cancel all requests and empty the loop's queue
+                continue;
+            }
+
             // TODO read and write shm
-            system_buffer = (PUCHAR)MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority);
             PUCHAR shmBuffer = (PUCHAR)device_extension->g_pSharedSection;
             PCONTEXT_REQUEST shmRequest = (PCONTEXT_REQUEST)device_extension->g_pSharedSection;
             LARGE_INTEGER timeout = { 0,0 };
             // Force 60 sec timeout
 //            timeout.QuadPart = -(60ll * 10 * 1000 * 1000);
-            timeout.QuadPart = 10000000000; // 10 seconds // 50 ms: 50000000;
+            timeout.QuadPart = 100; // 1000000000; // = 1 second delay // 10000000000; // = 10 seconds // 50 ms: 50000000;
             LARGE_INTEGER timeout2 = { 0,0 };
-            timeout2.QuadPart = 100000; // 100000000;// 50000000;
+            timeout2.QuadPart = 100; // 100000; // 100000000;// 50000000;
             NTSTATUS WaitStatus;
-            NTSTATUS shmResult;
-
             switch (io_stack->MajorFunction)
             {
             case IRP_MJ_READ:
@@ -1367,17 +1650,28 @@ FileDiskThread(
                 shmRequest->Length = io_stack->Parameters.Read.Length;
                 shmRequest->reply = DRIVER_SIGNATURE;
 
-                // set the data event and wait for it's unsetting
+                // delay for proper synchronisation of shared memory buffer and everything else in user mode and kernel mode
                 KeDelayExecutionThread(KernelMode, FALSE, &timeout2);
+                // set the data event for the proxy server to unblock and process the request
                 KeSetEvent(device_extension->KeDriverRequestDataSetObj, 100, TRUE);
                 //KePulseEvent(device_extension->KeDriverRequestDataSetObj, 1, TRUE);
 
+                // we cannot use indefinite wait, so we use spin lock loop which is breakable by user's command
                 while (TRUE)
                 {
-                    // terminate if user set the termination flag
+                    // cancel if user set the termination flag
                     if (device_extension->terminate_thread)
                     {
-                        irp->IoStatus.Status = STATUS_SUCCESS;
+                        irp->IoStatus.Status = STATUS_CANCELLED;// STATUS_SUCCESS;
+                        irp->IoStatus.Information = 0;
+                        KeSetEvent(device_extension->KeRequestCompleteObj, 100, TRUE);
+                        goto Completed;
+                    }
+
+                    // cancel if user set the file closing flag
+                    if (device_extension->fileClosingNow)
+                    {
+                        irp->IoStatus.Status = STATUS_CANCELLED;// STATUS_SUCCESS;
                         irp->IoStatus.Information = 0;
                         KeSetEvent(device_extension->KeRequestCompleteObj, 100, TRUE);
                         goto Completed;
@@ -1401,10 +1695,13 @@ FileDiskThread(
                     }
                 }
 
-                // set the systembuffer and configuration
+                // delay for proper synchronisation of shared memory buffer and everything else in user mode and kernel mode
                 KeDelayExecutionThread(KernelMode, FALSE, &timeout2);
-                RtlCopyMemory(system_buffer, shmBuffer + SHM_HEADER_SIZE, io_stack->Parameters.Read.Length);
-                //                _InterlockedExchange()
+
+                // the data has been read from the virtual disk file by the proxy app into the shared memory buffer, so write it to the window's provided system buffer.
+                // set the systembuffer and configuration
+                system_buffer = (PUCHAR)MmGetSystemAddressForMdlSafe(irp->MdlAddress, HighPagePriority);// NormalPagePriority);
+                RtlCopyBytes(system_buffer, shmBuffer + SHM_HEADER_SIZE, io_stack->Parameters.Read.Length);
 
                 /*
                 if (shmRequest->reply != USERMODEAPP_SIGNATURE)
@@ -1441,19 +1738,36 @@ FileDiskThread(
                 shmRequest->Length = io_stack->Parameters.Write.Length;
                 shmRequest->reply = DRIVER_SIGNATURE;
                 KeDelayExecutionThread(KernelMode, FALSE, &timeout2);
-                RtlCopyMemory(shmBuffer + SHM_HEADER_SIZE, system_buffer, io_stack->Parameters.Write.Length);
 
-                // set the data event and wait for it's unsetting
+                system_buffer = (PUCHAR)MmGetSystemAddressForMdlSafe(irp->MdlAddress, HighPagePriority | MdlMappingNoWrite);// NormalPagePriority);
+                RtlCopyBytes(shmBuffer + SHM_HEADER_SIZE, system_buffer, io_stack->Parameters.Write.Length);
+                //MmUnlockPages(irp->MdlAddress);
+  //              MmUnmapLockedPages(system_buffer, irp->MdlAddress);
+  //              IoFreeMdl(irp->MdlAddress);
+
+
+                // delay for proper synchronisation of shared memory buffer and everything else in user mode and kernel mode
                 KeDelayExecutionThread(KernelMode, FALSE, &timeout2);
+                // set the data event for the proxy server to unblock and process the request
                 KeSetEvent(device_extension->KeDriverRequestDataSetObj, 100, TRUE);
                 //KePulseEvent(device_extension->KeDriverRequestDataSetObj, 1, TRUE);
 
+                // we cannot use indefinite wait, so we use spin lock loop which is breakable by user's command
                 while (TRUE)
                 {
-                    // terminate if user set the termination flag
+                    // cancel if user set the termination flag
                     if (device_extension->terminate_thread)
                     {
-                        irp->IoStatus.Status = STATUS_SUCCESS;
+                        irp->IoStatus.Status = STATUS_CANCELLED;// STATUS_SUCCESS;
+                        irp->IoStatus.Information = 0;
+                        KeSetEvent(device_extension->KeRequestCompleteObj, 100, TRUE);
+                        goto Completed;
+                    }
+
+                    // cancel if user set the file closing flag
+                    if (device_extension->fileClosingNow)
+                    {
+                        irp->IoStatus.Status = STATUS_CANCELLED;// STATUS_SUCCESS;
                         irp->IoStatus.Information = 0;
                         KeSetEvent(device_extension->KeRequestCompleteObj, 100, TRUE);
                         goto Completed;
@@ -1477,6 +1791,10 @@ FileDiskThread(
                     }
                 }
 
+                // delay for proper synchronisation of shared memory buffer and everything else in user mode and kernel mode
+                KeDelayExecutionThread(KernelMode, FALSE, &timeout2);
+
+                // the data has been written by the proxy app into the backend file, so configure the final configuration and complete the request.
                 /*
                 if (shmRequest->reply != USERMODEAPP_SIGNATURE)
                 {
@@ -1498,32 +1816,18 @@ FileDiskThread(
 
         Completed:
 
+            //MmUnmapLockedPages(irp->MdlAddress->MappedSystemVa, irp->MdlAddress);
+            //IoFreeMdl(irp->MdlAddress);
+            //MmFreePagesFromMdl(irp->MdlAddress);
+
             IoCompleteRequest(
                 irp,
                 (CCHAR)(NT_SUCCESS(irp->IoStatus.Status) ?
                     IO_DISK_INCREMENT : IO_NO_INCREMENT)
             );
         }
+        
     }
-}
-
-NTSTATUS ReadDeviceCtxSharedMemory(PVOID Context, PIRP irp, PIO_STACK_LOCATION  io_stack)
-{
-    PDEVICE_OBJECT      device_object;
-    PDEVICE_EXTENSION   device_extension;
-    PUCHAR              system_buffer;
-    PUCHAR              buffer;
-
-    device_object = (PDEVICE_OBJECT)Context;
-    device_extension = (PDEVICE_EXTENSION)device_object->DeviceExtension;
-    system_buffer = (PUCHAR)MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority);
-
-
-}
-
-NTSTATUS WriteDeviceCtxSharedMemory(PVOID Context, PIRP irp)
-{
-
 }
 
 NTSTATUS
@@ -1597,6 +1901,7 @@ FileDiskOpenFile(
     open_file_information->DeviceNumber = device_extension->device_number;
 
     // finally set status
+    device_extension->fileClosingNow = FALSE;
     device_extension->media_in_device = TRUE;
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = sizeof(OPEN_FILE_INFORMATION);
@@ -1619,9 +1924,18 @@ FileDiskCloseFile(
     ASSERT(DeviceObject != NULL);
     ASSERT(Irp != NULL);
 
+    PLIST_ENTRY         request;
+    PIRP                irp;
+    PIO_STACK_LOCATION  io_stack;
+
     DbgPrint("IOCTL_DEREGISTER_FILE->FileDiskCloseFile method running.\r\n");
 
     device_extension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+
+    //TODO tushar
+    device_extension->fileClosingNow = TRUE;
+    // TODO tushar
+    FileDiskClearQueue((PVOID)DeviceObject);
 
     ExFreePool(device_extension->file_name.Buffer);
 
@@ -1632,6 +1946,7 @@ FileDiskCloseFile(
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
 
+    DbgPrint("IOCTL_DEREGISTER_FILE->FileDiskCloseFile method completed.\r\n");
     return STATUS_SUCCESS;
 }
 
@@ -1720,7 +2035,7 @@ NTSTATUS CreateSharedEventsKe(PDEVICE_OBJECT device_object)
 {
     PDEVICE_EXTENSION device_extension = (PDEVICE_EXTENSION)device_object->DeviceExtension;
     WCHAR             symbolicNameBuffer[256];
-    RtlZeroBytes(symbolicNameBuffer, sizeof(wchar_t) * 2);
+//    RtlZeroBytes(symbolicNameBuffer, sizeof(wchar_t) * 2);
     OBJECT_ATTRIBUTES ObjectAttributes;
     NTSTATUS status;
     PKEVENT eventHandle;
@@ -1735,7 +2050,7 @@ NTSTATUS CreateSharedEventsKe(PDEVICE_OBJECT device_object)
     RtlUnicodeStringPrintf(&uEventName, DEVICE_OBJECT_SHM_EVENT_REQUEST_DATA L"%u", device_extension->device_number);
     InitializeObjectAttributes(&ObjectAttributes, &uEventName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
     eventHandle = IoCreateSynchronizationEvent(&uEventName, &device_extension->DriverRequestDataSet);
-    RtlZeroBytes(symbolicNameBuffer, sizeof(wchar_t) * 2);
+//    RtlZeroBytes(symbolicNameBuffer, sizeof(wchar_t) * 2);
 
     if (eventHandle == NULL)
     {
@@ -1761,7 +2076,7 @@ NTSTATUS CreateSharedEventsKe(PDEVICE_OBJECT device_object)
     RtlUnicodeStringPrintf(&uEventName, DEVICE_OBJECT_SHM_EVENT_PROXY_IDLE L"%u", device_extension->device_number);
     InitializeObjectAttributes(&ObjectAttributes, &uEventName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
     eventHandle = IoCreateSynchronizationEvent(&uEventName, &device_extension->ProxyIdle);
-    RtlZeroBytes(symbolicNameBuffer, sizeof(wchar_t) * 2);
+//    RtlZeroBytes(symbolicNameBuffer, sizeof(wchar_t) * 2);
 
     if (eventHandle == NULL)
     {
@@ -1789,7 +2104,7 @@ NTSTATUS CreateSharedEventsKe(PDEVICE_OBJECT device_object)
     RtlUnicodeStringPrintf(&uEventName, DEVICE_OBJECT_SHM_REQUESTCOMPLETE L"%u", device_extension->device_number);
     InitializeObjectAttributes(&ObjectAttributes, &uEventName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
     eventHandle = IoCreateSynchronizationEvent(&uEventName, &device_extension->RequestComplete);
-    RtlZeroBytes(symbolicNameBuffer, sizeof(wchar_t) * 2);
+//    RtlZeroBytes(symbolicNameBuffer, sizeof(wchar_t) * 2);
 
     if (eventHandle == NULL)
     {
@@ -1799,7 +2114,7 @@ NTSTATUS CreateSharedEventsKe(PDEVICE_OBJECT device_object)
         return STATUS_UNSUCCESSFUL;
     }
 
-    // set security event 2
+    // set security event 3
     status = SetSecurityAllAccess(device_extension->RequestComplete, &device_extension->pRequestCompleteObj);
     if (status != STATUS_SUCCESS)
     {
@@ -1819,6 +2134,7 @@ NTSTATUS CreateSharedEventsKe(PDEVICE_OBJECT device_object)
     return status;
 }
 
+/*
 NTSTATUS CreateSharedEvents(PDEVICE_OBJECT device_object)
 {
     PDEVICE_EXTENSION device_extension = (PDEVICE_EXTENSION)device_object->DeviceExtension;
@@ -1912,32 +2228,28 @@ NTSTATUS CreateSharedEvents(PDEVICE_OBJECT device_object)
     DbgPrint("CreateSharedEvents method completed!\r\n");
     return status;
 }
+*/
 
 void DeleteSharedEvents(PDEVICE_OBJECT device_object)
 {
     PDEVICE_EXTENSION device_extension = (PDEVICE_EXTENSION)device_object->DeviceExtension;
     DbgPrint("Driver-->DeviceObject->DeleteSharedEvents routine started - removing device shared events %u\r\n", device_extension->device_number);
-    ZwClose(device_extension->DriverRequestDataSet);
+    
+    //KeClearEvent(device_extension->KeDriverRequestDataSetObj);
+    //KeClearEvent(device_extension->KeProxyIdleObj);
+    //KeClearEvent(device_extension->KeRequestCompleteObj);
+//    ObDereferenceObject(device_extension->KeDriverRequestDataSetObj);
     ObDereferenceObject(device_extension->pDriverRequestDataSetObj);
-    ZwClose(device_extension->ProxyIdle);
+    ZwClose(device_extension->DriverRequestDataSet);
+  //  ObDereferenceObject(device_extension->KeProxyIdleObj);
     ObDereferenceObject(device_extension->pProxyIdleObj);
-    ZwClose(device_extension->RequestComplete);
+    ZwClose(device_extension->ProxyIdle);
+    //ObDereferenceObject(device_extension->KeRequestCompleteObj);
     ObDereferenceObject(device_extension->pRequestCompleteObj);
+    ZwClose(device_extension->RequestComplete);
     DbgPrint("Driver-->DeviceObject->DeleteSharedEvents routine completed!\r\n");
 
     // TODO - delete all device's objects and handles
-
-}
-
-void CreateSharedMutex(PDEVICE_OBJECT device_object)
-{
-    NTSTATUS ntStatus = STATUS_UNSUCCESSFUL;
-    PDEVICE_EXTENSION device_extension = (PDEVICE_EXTENSION)device_object->DeviceExtension;
-    WCHAR             symbolicNameBuffer[256];
-    RtlZeroBytes(symbolicNameBuffer, sizeof(wchar_t) * 2);
-
-    
-    KeInitializeMutex(device_extension->shmMutexObj, NULL);
 
 }
 
@@ -2019,6 +2331,7 @@ void ReleaseSharedMemory(PDEVICE_OBJECT device_object)
     return TRUE;
 }
 
+/*
 NTSTATUS connectReqServerPipeline(PDEVICE_OBJECT device_object)
 {
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -2079,6 +2392,7 @@ NTSTATUS disconnectReqServerPipeline(PDEVICE_OBJECT device_object)
     device_extension->hReqServerPipe = NULL;
     return status;
 }
+*/
 
 void printStatusFile(char* path, char* status)
 {
